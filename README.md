@@ -55,6 +55,28 @@ shader inputs. The bottom lines show the latest changes, e.g.
 
 `.git`, `node_modules`, `__pycache__`, `.venv` and `.idea` are ignored.
 
+## Configuration
+
+Settings are taken from these places, and later ones win: built-in default <
+config file < environment < command line.
+
+| setting | config file    | environment              | command line   | default  |
+|---------|----------------|--------------------------|----------------|----------|
+| shader  | `shader = oil` | `VIBEMATRIX_SHADER=oil`  | `--shader oil` | `smoke2` |
+
+The config file is `$XDG_CONFIG_HOME/vibematrix/config`, or
+`~/.config/vibematrix/config` if `XDG_CONFIG_HOME` is unset. It uses one
+`key = value` per line, and `#` starts a comment:
+
+```sh
+mkdir -p ~/.config/vibematrix
+echo 'shader = oil' > ~/.config/vibematrix/config
+```
+
+A missing config file is fine. A malformed line or an unknown key stops
+vibematrix with the file and line number. An unknown shader name says where it
+came from, e.g. `unknown shader 'x' (from VIBEMATRIX_SHADER)`.
+
 ## Demo / recording
 
 `demo.sh` generates endless file activity, so you can watch or record vibematrix

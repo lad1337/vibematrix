@@ -11,6 +11,9 @@
 // every cube shader gets it unchanged (like cube's ANIMSTEP on the CPU side).
 //
 // build: make      run: ./vibematrix [DIR] [--shader NAME]   (q / esc quits)   test: ./vibematrix --test
+// settings, later wins: built-in default < config file < environment < command line
+//   config file  $XDG_CONFIG_HOME/vibematrix/config (else ~/.config/vibematrix/config), `key = value`
+//   shader       config `shader = oil`   env VIBEMATRIX_SHADER=oil   arg --shader oil
 // macOS only: CGL offscreen OpenGL + FSEvents.
 #define GL_SILENCE_DEPRECATION
 #include <CoreServices/CoreServices.h>
@@ -617,9 +620,62 @@ static void run(const char *name) {
     tcsetattr(0, TCSANOW, &saved_term);
 }
 
+// ------------------------------------------------------------ settings
+
+typedef struct {
+    const char *shader;
+    char shader_from[PATH_MAX + 32]; // where the value came from, for error messages
+} Settings;
+
+static char *trim(char *s) {
+    while (*s == ' ' || *s == '\t') s++;
+    char *e = s + strlen(s);
+    while (e > s && strchr(" \t\r\n", e[-1])) *--e = 0;
+    return s;
+}
+
+// XDG base dir spec: XDG_CONFIG_HOME only counts if absolute, else ~/.config
+static int config_path(char *buf, size_t n) {
+    const char *x = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
+    if (x && x[0] == '/') return snprintf(buf, n, "%s/vibematrix/config", x), 1;
+    if (home && *home) return snprintf(buf, n, "%s/.config/vibematrix/config", home), 1;
+    return 0;
+}
+
+// `key = value` lines, `#` comments; a missing file is fine, a wrong one is an error
+static void config_read(FILE *f, const char *path, Settings *s) {
+    char line[1024];
+    for (int no = 1; fgets(line, sizeof line, f); no++) {
+        char *l = trim(line), *eq = strchr(l, '=');
+        if (!*l || *l == '#') continue;
+        if (!eq) die("%s:%d: expected `key = value`, got `%s`", path, no, l);
+        *eq = 0;
+        char *key = trim(l), *val = trim(eq + 1);
+        if (!strcmp(key, "shader") && *val) {
+            s->shader = strdup(val);
+            snprintf(s->shader_from, sizeof s->shader_from, "%s:%d", path, no);
+        } else {
+            die("%s:%d: unknown or empty setting `%s` (known: shader)", path, no, key);
+        }
+    }
+}
+
 // ------------------------------------------------------------ self-test
 
 static void selftest(void) {
+    // config: comments, blank lines, spacing; later lines win
+    Settings cs = {.shader = "default"};
+    char cfg[] = "# vibematrix\n\n  shader =  oil \r\n\tshader=smoke\n";
+    FILE *cf = fmemopen(cfg, strlen(cfg), "r");
+    config_read(cf, "cfg", &cs);
+    fclose(cf);
+    assert(!strcmp(cs.shader, "smoke") && !strcmp(cs.shader_from, "cfg:4"));
+    char cp[PATH_MAX];
+    setenv("XDG_CONFIG_HOME", "/x", 1);
+    assert(config_path(cp, sizeof cp) && !strcmp(cp, "/x/vibematrix/config"));
+    setenv("XDG_CONFIG_HOME", "relative", 1), setenv("HOME", "/h", 1); // relative: ignored per spec
+    assert(config_path(cp, sizeof cp) && !strcmp(cp, "/h/.config/vibematrix/config"));
+
     // path map survives growth
     char p[64];
     for (int i = 0; i < 10000; i++) snprintf(p, sizeof p, "/x/%d", i), entry(p)->size = i;
@@ -730,20 +786,29 @@ int main(int argc, char **argv) {
     snprintf(shader_dir, sizeof shader_dir, "%s/shader", bindir);
     if (access(shader_dir, R_OK)) snprintf(shader_dir, sizeof shader_dir, "%s/../share/vibematrix/shader", bindir);
 
-    const char *name = DEFAULT_SHADER, *dir = ".";
+    // later wins: built-in default < config file < environment < command line
+    Settings set = {.shader = DEFAULT_SHADER, .shader_from = "built-in default"};
+    char cpath[PATH_MAX];
+    FILE *cf = config_path(cpath, sizeof cpath) ? fopen(cpath, "r") : NULL;
+    if (cf) config_read(cf, cpath, &set), fclose(cf);
+    const char *env = getenv("VIBEMATRIX_SHADER");
+    if (env && *env) set.shader = env, snprintf(set.shader_from, sizeof set.shader_from, "VIBEMATRIX_SHADER");
+
+    const char *dir = ".";
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--test")) return selftest(), 0;
-        else if (!strcmp(argv[i], "--shader") && i + 1 < argc) name = argv[++i];
+        else if (!strcmp(argv[i], "--shader") && i + 1 < argc)
+            set.shader = argv[++i], snprintf(set.shader_from, sizeof set.shader_from, "--shader");
         else if (argv[i][0] == '-') die("usage: %s [DIR] [--shader NAME] | --test", argv[0]);
         else dir = argv[i];
     }
-    if (!shader_exists(name)) {
-        fprintf(stderr, "unknown shader '%s'; available:", name);
+    if (!shader_exists(set.shader)) {
+        fprintf(stderr, "unknown shader '%s' (from %s); available:", set.shader, set.shader_from);
         list_shaders(stderr);
         return 1;
     }
     struct stat st;
     if (!realpath(dir, root) || stat(root, &st) || !S_ISDIR(st.st_mode)) die("not a directory: %s", dir);
-    run(name);
+    run(set.shader);
     return 0;
 }
