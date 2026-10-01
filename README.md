@@ -1,6 +1,6 @@
 # vibematrix
 
-A music-visualizer for your files. vibematrix watches a directory and plays the
+A byte visualizer for your files. vibematrix watches a directory and plays the
 [LED cube](https://github.com/lad1337/cube) GLSL shaders full-screen in your
 terminal, driven by what changes: new files, edited lines, deletions. Quiet
 directory, calm grey smoke. Busy directory, colour and motion.
@@ -45,6 +45,8 @@ vibematrix                     # watch the current directory
 vibematrix ~/code/project      # watch a directory
 vibematrix . --shader oil      # pick a shader
 vibematrix --shader x          # unknown name: lists the available shaders
+vibematrix --help              # options, config file location, available shaders
+vibematrix --version
 ```
 
 Quit with `q` or `Esc`.

@@ -44,6 +44,9 @@
 #include <unistd.h>
 
 #define DEFAULT_SHADER "smoke2" // same default as cube's cpu-stats-gl.cpp
+#ifndef VERSION
+#define VERSION "dev" // make passes `git describe`, brew passes the formula version
+#endif
 #define FPS 30
 #define TIME_SPEED 1.0     // shader `time` per second
 #define FILES_MAX 8.0      // files/s for load = 1 (log scale: 1 file/s ~ 0.45)
@@ -177,11 +180,14 @@ static int skipped(const char *p) {
 
 // ------------------------------------------------------------ events shared with the FSEvents queue
 
+// The path table (entry/tab) is only touched from the serial FS queue, so it needs no lock.
+// `mu` guards just `shared`, and is never held across file I/O: the render loop takes it
+// every frame and must never wait on the disk (that froze the UI, q and signals).
 static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER;
 static char root[PATH_MAX];
 static struct {
     double files_ev, added, removed; // accumulated since the main loop last took them
-    int any;
+    int any, scanning;
     long files;
     struct { char kind; char text[400]; } log[LOG_LINES];
 } shared;
@@ -193,13 +199,13 @@ static void on_path(const char *p) {
     int exists = !lstat(p, &st) && S_ISREG(st.st_mode);
     Entry *e = entry(p);
     char kind;
-    long add, del;
+    long add, del, dfiles = 0;
     if (exists) {
         uint64_t *h;
-        size_t n = hash_lines(p, st.st_size, &h);
+        size_t n = hash_lines(p, st.st_size, &h); // file I/O: outside the lock
         kind = e->size < 0 ? '+' : '~';
         line_diff(e->lines, e->nlines, h, n, &add, &del); // new file: everything is added
-        shared.files += e->size < 0;
+        dfiles = e->size < 0;
         free(e->lines);
         e->lines = h, e->nlines = n, e->size = st.st_size;
     } else if (e->size >= 0) {
@@ -207,28 +213,29 @@ static void on_path(const char *p) {
         add = 0, del = (long)e->nlines;
         free(e->lines);
         e->lines = NULL, e->nlines = 0, e->size = -1;
-        shared.files--;
+        dfiles = -1;
     } else {
         return; // came and went between batches
     }
+    size_t rl = strlen(root);
+    const char *rel = !strncmp(p, root, rl) && p[rl] == '/' ? p + rl + 1 : p;
+    pthread_mutex_lock(&mu);
+    shared.files += dfiles;
     shared.files_ev++;
     shared.added += add;
     shared.removed += del;
     shared.any = 1;
     memmove(shared.log, shared.log + 1, sizeof shared.log[0] * (LOG_LINES - 1));
-    size_t rl = strlen(root);
-    const char *rel = !strncmp(p, root, rl) && p[rl] == '/' ? p + rl + 1 : p;
     shared.log[LOG_LINES - 1].kind = kind;
     snprintf(shared.log[LOG_LINES - 1].text, sizeof shared.log[0].text, "%c %s  (+%ld -%ld lines)", kind, rel, add, del);
+    pthread_mutex_unlock(&mu);
 }
 
 static void fs_cb(ConstFSEventStreamRef s, void *info, size_t n, void *paths,
                   const FSEventStreamEventFlags flags[], const FSEventStreamEventId ids[]) {
     (void)s, (void)info, (void)flags, (void)ids;
     // ponytail: kFSEventStreamEventFlagMustScanSubDirs (dropped events) is ignored; rescan there if it bites
-    pthread_mutex_lock(&mu);
     for (size_t i = 0; i < n; i++) on_path(((char **)paths)[i]);
-    pthread_mutex_unlock(&mu);
 }
 
 static void scan(void) {
@@ -240,8 +247,10 @@ static void scan(void) {
         else if (e->fts_info == FTS_F) {
             Entry *x = entry(e->fts_path);
             x->size = e->fts_statp->st_size;
-            x->nlines = hash_lines(e->fts_path, x->size, &x->lines);
+            x->nlines = hash_lines(e->fts_path, x->size, &x->lines); // file I/O: outside the lock
+            pthread_mutex_lock(&mu);
             shared.files++;
+            pthread_mutex_unlock(&mu);
         }
     }
     if (f) fts_close(f);
@@ -250,9 +259,11 @@ static void scan(void) {
 static void watch(void) {
     // hash the tree on the FS queue, so the animation starts right away on big trees
     dispatch_queue_t q = dispatch_queue_create("vibematrix.fs", NULL);
+    shared.scanning = 1; // queue not started yet: no lock needed
     dispatch_async(q, ^{
-        pthread_mutex_lock(&mu);
         scan();
+        pthread_mutex_lock(&mu);
+        shared.scanning = 0;
         pthread_mutex_unlock(&mu);
     });
     CFStringRef cfroot = CFStringCreateWithCString(NULL, root, kCFStringEncodingUTF8);
@@ -498,8 +509,20 @@ static void draw_field(Buf *b, const unsigned char *px, unsigned char *prev, int
 }
 
 static struct termios saved_term;
+static int out_flags;
 static volatile sig_atomic_t quit;
-static void on_signal(int s) { (void)s, quit = 1; }
+// First signal asks the loop to quit cleanly. A second one means it didn't: restore the
+// terminal and leave right here (only async-signal-safe calls).
+static void on_signal(int s) {
+    if (quit) {
+        static const char reset[] = "\x1b[0m\x1b[?25h\x1b[?1049l";
+        fcntl(1, F_SETFL, out_flags);
+        (void)!write(1, reset, sizeof reset - 1);
+        tcsetattr(0, TCSANOW, &saved_term);
+        _exit(128 + s);
+    }
+    quit = 1;
+}
 
 static double now_s(void) {
     struct timespec ts;
@@ -533,11 +556,12 @@ static void run(const char *name) {
     g.last = last - 60; // start idle (grey in smoke2)
     struct { char kind; char text[400]; } log[LOG_LINES] = {0};
     long files = 0;
+    int scanning = 1;
 
     // Output is non-blocking: a new frame is only encoded once the terminal has taken the
     // previous one, so a slow terminal drops frames instead of piling up lag, and keys are
     // read while waiting for it.
-    int out_flags = fcntl(1, F_GETFL);
+    out_flags = fcntl(1, F_GETFL);
     fcntl(1, F_SETFL, out_flags | O_NONBLOCK);
     size_t off = 0; // b.p[off..b.n) is still unwritten
     double next = now_s();
@@ -573,7 +597,7 @@ static void run(const char *name) {
         g.files += shared.files_ev, g.added += shared.added, g.removed += shared.removed;
         shared.files_ev = shared.added = shared.removed = 0, shared.any = 0;
         memcpy(log, shared.log, sizeof log);
-        files = shared.files;
+        files = shared.files, scanning = shared.scanning;
         pthread_mutex_unlock(&mu);
         sig_step(&g, dt);
         t += dt * TIME_SPEED;
@@ -596,8 +620,8 @@ static void run(const char *name) {
         if (full) bput(&b, "\x1b[0m\x1b[2J");
         draw_field(&b, px, prev, cols, frows, full);
         char head[1024];
-        int hn = snprintf(head, sizeof head, " vibematrix  files %.2f  +lines %.2f  -lines %.2f  age %3.0fs  [q]uit  %s  %ld files  %s",
-                          g.load.x, g.download.x, g.upload.x, fmin(age, 999), name, files, root); // path last: may be cut
+        int hn = snprintf(head, sizeof head, " vibematrix  files %.2f  +lines %.2f  -lines %.2f  age %3.0fs  [q]uit  %s  %s%ld files  %s",
+                          g.load.x, g.download.x, g.upload.x, fmin(age, 999), name, scanning ? "indexing… " : "", files, root); // path last: may be cut
         bput(&b, "\x1b[1;1H\x1b[0;1;97;40m%.*s\x1b[K", hn < cols ? hn : cols, head);
         for (int i = 0; i < LOG_LINES && frows + 2 + i <= rows; i++) {
             const char *col = log[i].kind == '+' ? "32" : log[i].kind == '-' ? "31" : "33";
@@ -786,6 +810,30 @@ int main(int argc, char **argv) {
     snprintf(shader_dir, sizeof shader_dir, "%s/shader", bindir);
     if (access(shader_dir, R_OK)) snprintf(shader_dir, sizeof shader_dir, "%s/../share/vibematrix/shader", bindir);
 
+    // answered before reading the config, so a broken config can't get in the way
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--version")) return puts("vibematrix " VERSION), 0;
+        if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
+            char cp[PATH_MAX];
+            printf("vibematrix %s: LED cube GLSL shaders in the terminal, driven by file changes\n\n"
+                   "usage: vibematrix [DIR] [--shader NAME]\n\n"
+                   "  DIR             directory to watch, recursively (default: .)\n"
+                   "  --shader NAME   shader to play (default: %s)\n"
+                   "  --test          run the self-test\n"
+                   "  --version       print the version\n"
+                   "  -h, --help      print this help\n\n"
+                   "keys: q or Esc quits (Ctrl-C too)\n\n"
+                   "settings, later wins: default < config file < environment < command line\n"
+                   "  config file  %s\n"
+                   "               shader = NAME\n"
+                   "  environment  VIBEMATRIX_SHADER=NAME\n\n"
+                   "shaders (%s):\n",
+                   VERSION, DEFAULT_SHADER, config_path(cp, sizeof cp) ? cp : "(no $HOME)", shader_dir);
+            list_shaders(stdout);
+            return 0;
+        }
+    }
+
     // later wins: built-in default < config file < environment < command line
     Settings set = {.shader = DEFAULT_SHADER, .shader_from = "built-in default"};
     char cpath[PATH_MAX];
@@ -799,7 +847,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--test")) return selftest(), 0;
         else if (!strcmp(argv[i], "--shader") && i + 1 < argc)
             set.shader = argv[++i], snprintf(set.shader_from, sizeof set.shader_from, "--shader");
-        else if (argv[i][0] == '-') die("usage: %s [DIR] [--shader NAME] | --test", argv[0]);
+        else if (argv[i][0] == '-') die("unknown option '%s'; see vibematrix --help", argv[i]);
         else dir = argv[i];
     }
     if (!shader_exists(set.shader)) {

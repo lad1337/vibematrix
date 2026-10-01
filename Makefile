@@ -1,8 +1,9 @@
 PREFIX ?= /usr/local
 CFLAGS ?= -O2 -Wall -Wextra
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 
 vibematrix: vibematrix.c
-	$(CC) $(CFLAGS) -o $@ $< -framework OpenGL -framework CoreServices
+	$(CC) $(CFLAGS) -DVERSION='"$(VERSION)"' -o $@ $< -framework OpenGL -framework CoreServices
 
 test: vibematrix
 	./vibematrix --test

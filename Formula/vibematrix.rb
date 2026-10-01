@@ -8,10 +8,11 @@ class Vibematrix < Formula
   depends_on :macos # CGL offscreen OpenGL + FSEvents
 
   def install
-    system "make", "install", "PREFIX=#{prefix}"
+    system "make", "install", "PREFIX=#{prefix}", "VERSION=#{version}"
   end
 
   test do
+    assert_match version.to_s, shell_output("#{bin}/vibematrix --version")
     # parses args and finds the installed shaders
     assert_match "smoke2", shell_output("#{bin}/vibematrix --shader nope 2>&1", 1)
     # line diffing, smoothing, and every shader compiling on this machine's GL
