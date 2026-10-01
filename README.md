@@ -5,6 +5,11 @@ A music-visualizer for your files. vibematrix watches a directory and plays the
 terminal, driven by what changes: new files, edited lines, deletions. Quiet
 directory, calm grey smoke. Busy directory, colour and motion.
 
+![vibematrix reacting to a burst of new files, edits and deletions](assets/demo.webp)
+
+*33 seconds of [`demo.sh`](demo.sh) activity with the default `smoke2` shader.
+[Full-quality video (MP4)](assets/demo.mp4).*
+
 macOS only (offscreen OpenGL via CGL, file events via FSEvents). Needs a
 truecolor terminal. Ghostty, kitty, iTerm2 and WezTerm work well; Terminal.app
 works but slower.
@@ -65,6 +70,12 @@ trickle of small edits, a burst of new files, a refactor, deletions, and one
 20,000-line file that appears and then goes away. `SPEED=2 ./demo.sh …` runs it
 twice as fast. Without a directory argument it uses a temporary one and removes
 it on Ctrl-C.
+
+`make video` re-records the clip at the top of this README into `assets/`. It
+needs `brew install asciinema agg ffmpeg webp`. asciinema records the terminal
+headless with real timing, agg renders it to frames offline (so the timing stays
+correct however heavy the output), and ffmpeg/gif2webp produce `demo.mp4` and the
+`demo.webp` preview.
 
 ## How changes drive the shaders
 
