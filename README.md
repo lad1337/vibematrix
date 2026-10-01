@@ -50,6 +50,22 @@ shader inputs. The bottom lines show the latest changes, e.g.
 
 `.git`, `node_modules`, `__pycache__`, `.venv` and `.idea` are ignored.
 
+## Demo / recording
+
+`demo.sh` generates endless file activity, so you can watch or record vibematrix
+without touching real files:
+
+```sh
+./demo.sh /tmp/demo          # terminal 1: keeps changing files in /tmp/demo
+vibematrix /tmp/demo         # terminal 2: record this one
+```
+
+One round takes about 45 seconds, then repeats: quiet (fades to grey), a
+trickle of small edits, a burst of new files, a refactor, deletions, and one
+20,000-line file that appears and then goes away. `SPEED=2 ./demo.sh …` runs it
+twice as fast. Without a directory argument it uses a temporary one and removes
+it on Ctrl-C.
+
 ## How changes drive the shaders
 
 The shaders take the same uniforms as on the cube, where they come from CPU and

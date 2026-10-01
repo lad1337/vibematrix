@@ -583,8 +583,8 @@ static void run(const char *name) {
         if (full) bput(&b, "\x1b[0m\x1b[2J");
         draw_field(&b, px, prev, cols, frows, full);
         char head[1024];
-        int hn = snprintf(head, sizeof head, " vibematrix  %s  %s  %ld files   files %.2f  +lines %.2f  -lines %.2f  age %.0fs  [q]uit",
-                          name, root, files, g.load.x, g.download.x, g.upload.x, fmin(age, 999));
+        int hn = snprintf(head, sizeof head, " vibematrix  files %.2f  +lines %.2f  -lines %.2f  age %3.0fs  [q]uit  %s  %ld files  %s",
+                          g.load.x, g.download.x, g.upload.x, fmin(age, 999), name, files, root); // path last: may be cut
         bput(&b, "\x1b[1;1H\x1b[0;1;97;40m%.*s\x1b[K", hn < cols ? hn : cols, head);
         for (int i = 0; i < LOG_LINES && frows + 2 + i <= rows; i++) {
             const char *col = log[i].kind == '+' ? "32" : log[i].kind == '-' ? "31" : "33";
@@ -593,9 +593,17 @@ static void run(const char *name) {
         bput(&b, "\x1b[0m\x1b[?2026l");
         off = 0;
     }
+    // drop any unsent rest of the frame; the ESC starting the reset makes terminals discard a
+    // cut-off sequence. Give a terminal that isn't reading (paused, ctrl-s) 1s, then exit anyway.
+    const char *reset = "\x1b[0m\x1b[?25h\x1b[?1049l";
+    for (size_t n = strlen(reset), sent = 0; sent < n;) {
+        struct pollfd pfd = {1, POLLOUT, 0};
+        if (poll(&pfd, 1, 1000) <= 0) break;
+        ssize_t k = write(1, reset + sent, n - sent);
+        if (k <= 0) break;
+        sent += k;
+    }
     fcntl(1, F_SETFL, out_flags);
-    write_all(b.p + off, b.n - off); // finish a half-sent frame so no escape sequence is left cut
-    write_all("\x1b[0m\x1b[?25h\x1b[?1049l", 18);
     tcsetattr(0, TCSANOW, &saved_term);
 }
 
