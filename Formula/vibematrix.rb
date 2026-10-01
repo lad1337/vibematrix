@@ -1,10 +1,9 @@
 class Vibematrix < Formula
   desc "Terminal visualizer: LED cube GLSL shaders driven by file changes"
   homepage "https://github.com/lad1337/vibematrix"
+  url "https://github.com/lad1337/vibematrix/archive/refs/tags/v0.1.0.tar.gz"
+  sha256 "74782667b8726512429c3255840c99123ce3586b230d3d7c2fd7b6583f0add05"
   head "https://github.com/lad1337/vibematrix.git", branch: "main"
-  # Stable release: tag v0.1.0 on GitHub, then add
-  #   url "https://github.com/lad1337/vibematrix/archive/refs/tags/v0.1.0.tar.gz"
-  #   sha256 "<curl -sL that-url | shasum -a 256>"
 
   depends_on :macos # CGL offscreen OpenGL + FSEvents
 
