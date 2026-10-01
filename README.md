@@ -66,6 +66,9 @@ config file < environment < command line.
 |---------|----------------|--------------------------|----------------|----------|
 | shader  | `shader = oil` | `VIBEMATRIX_SHADER=oil`  | `--shader oil` | `smoke2` |
 
+`shader` takes a built-in name or a path to your own `.glsl` file (see
+[Your own shaders](#your-own-shaders)).
+
 The config file is `$XDG_CONFIG_HOME/vibematrix/config`, or
 `~/.config/vibematrix/config` if `XDG_CONFIG_HOME` is unset. It uses one
 `key = value` per line, and `#` starts a comment:
@@ -131,9 +134,22 @@ All shaders from the cube repo are in `shader/`: `2colerSmoke`, `art`,
 `smoke2` (default), `smoke2.1`, `star`, `thundersee`, `tunnel` and `voronoi`.
 `flight` is broken upstream: its `render()` never returns a value.
 
-To add your own, drop a `render.NAME.glsl` into `shader/` that defines
-`vec4 render(vec2 p)`. It is spliced into `fragment.template.glsl`, exactly as
-on the cube. Then run `vibematrix --shader NAME`.
+### Your own shaders
+
+Write a `.glsl` file that defines `vec4 render(vec2 p)` and pass its path:
+
+```sh
+vibematrix --shader ~/shaders/pulse.glsl
+```
+
+It reloads every time you save. A broken save keeps the last working version
+running and shows the error, with your file's line number, in the header.
+Paths also work in `VIBEMATRIX_SHADER` and in the config file. Keep your
+shaders outside the install directory, which `brew upgrade` replaces.
+
+**[SHADERS.md](SHADERS.md)** is the full spec: the coordinates of `p`, the
+uniforms (`time`, `load`, `download`, `upload`, `age`, …), the GLSL dialect, a
+starter example, and how to run the same file on the LED cube.
 
 ## Tuning
 

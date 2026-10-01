@@ -10,7 +10,8 @@
 // Smoothing lives here, not in GLSL: shaders keep no state between frames, and this way
 // every cube shader gets it unchanged (like cube's ANIMSTEP on the CPU side).
 //
-// build: make      run: ./vibematrix [DIR] [--shader NAME]   (q / esc quits)   test: ./vibematrix --test
+// build: make      run: ./vibematrix [DIR] [--shader NAME|PATH]   (q / esc quits)   test: ./vibematrix --test
+// custom shaders: --shader path/to/file.glsl, live-reloaded on save; spec in SHADERS.md
 // settings, later wins: built-in default < config file < environment < command line
 //   config file  $XDG_CONFIG_HOME/vibematrix/config (else ~/.config/vibematrix/config), `key = value`
 //   shader       config `shader = oil`   env VIBEMATRIX_SHADER=oil   arg --shader oil
@@ -309,9 +310,7 @@ static void sig_step(Sig *s, double dt) {
 
 static char shader_dir[PATH_MAX];
 
-static char *slurp(const char *dir, const char *name) {
-    char path[PATH_MAX];
-    snprintf(path, sizeof path, "%s/%s", dir, name);
+static char *slurp(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -329,6 +328,43 @@ typedef struct {
     GLint u_time, u_load, u_down, u_up, u_age, u_pf, u_res, u_mouse;
 } Shader;
 
+static void shader_free(Shader *s) {
+    glDeleteProgram(s->prog);
+    glDeleteVertexArrays(1, &s->vao), glDeleteBuffers(1, &s->vbo);
+    glDeleteFramebuffers(1, &s->fbo), glDeleteRenderbuffers(1, &s->rb);
+    memset(s, 0, sizeof *s);
+}
+
+// a value with a '/' or ending in .glsl is a file (~/ expanded), anything else a built-in name
+static int is_shader_file(const char *spec) {
+    size_t l = strlen(spec);
+    return strchr(spec, '/') || (l > 5 && !strcmp(spec + l - 5, ".glsl"));
+}
+
+static void shader_path(const char *spec, char *out, size_t n) {
+    const char *home = getenv("HOME");
+    if (!is_shader_file(spec))
+        snprintf(out, n, "%s/render.%s.glsl", shader_dir, spec);
+    else if (!strncmp(spec, "~/", 2) && home)
+        snprintf(out, n, "%s/%s", home, spec + 2);
+    else
+        snprintf(out, n, "%s", spec);
+}
+
+// "ERROR: 1:3: ..." (source string 1 = the render file, see #line below) -> "mine.glsl:3: ..."
+static void name_errors(char *err, size_t errn, const char *path) {
+    const char *base = strrchr(path, '/') ? strrchr(path, '/') + 1 : path;
+    char out[4096];
+    size_t o = 0;
+    for (const char *p = err; *p && o + 256 < sizeof out;) {
+        int skip = !strncmp(p, "ERROR: 1:", 9) ? 9 : !strncmp(p, "WARNING: 1:", 11) ? 11 : 0;
+        if (skip) o += snprintf(out + o, sizeof out - o, "%s%s:", skip == 11 ? "warning: " : "", base), p += skip;
+        else out[o++] = *p++;
+    }
+    out[o] = 0;
+    snprintf(err, errn, "%s", out);
+}
+
 static GLuint compile(GLenum type, const char *src, char *err, size_t errn) {
     GLuint s = glCreateShader(type);
     glShaderSource(s, 1, &src, NULL);
@@ -343,13 +379,14 @@ static GLuint compile(GLenum type, const char *src, char *err, size_t errn) {
     return s;
 }
 
-// assemble like cpu-stats-gl.cpp: header + template with render.NAME.glsl spliced in at the marker
-static int shader_load(Shader *sh, const char *name, char *err, size_t errn) {
-    char fname[256];
-    snprintf(fname, sizeof fname, "render.%s.glsl", name);
-    char *vert = slurp(shader_dir, "vertex.original.glsl"), *tmpl = slurp(shader_dir, "fragment.template.glsl"),
-         *body = slurp(shader_dir, fname);
-    if (!vert || !tmpl || !body) return snprintf(err, errn, "missing shader files in %s", shader_dir), 0;
+// assemble like cpu-stats-gl.cpp: header + template with the render file spliced in at the marker
+static int shader_load(Shader *sh, const char *path, char *err, size_t errn) {
+    char vp[PATH_MAX], tp[PATH_MAX];
+    snprintf(vp, sizeof vp, "%s/vertex.original.glsl", shader_dir);
+    snprintf(tp, sizeof tp, "%s/fragment.template.glsl", shader_dir);
+    char *vert = slurp(vp), *tmpl = slurp(tp), *body = slurp(path);
+    if (!body) return snprintf(err, errn, "cannot read %s", path), 0;
+    if (!vert || !tmpl) return snprintf(err, errn, "missing shader files in %s", shader_dir), 0;
     char *marker = strstr(tmpl, "// RENDER ENDS HERE");
     if (!marker) return snprintf(err, errn, "no RENDER ENDS HERE marker in template"), 0;
     // #extension must precede code in GLSL 330; the GLES ones these use are core anyway
@@ -359,15 +396,20 @@ static int shader_load(Shader *sh, const char *name, char *err, size_t errn) {
         if (!strncmp(t, "#extension", 10)) memset(l, ' ', (nl ? nl : l + strlen(l)) - l);
         l = nl ? nl + 1 : l + strlen(l);
     }
-    char *vs, *fs;
+    char *vs, *fs, *pre;
     asprintf(&vs, "%s%s", HEADER, vert);
-    asprintf(&fs, "%s%s%.*s%s%s", HEADER, FRAG_EXTRA, (int)(marker - tmpl), tmpl, body, marker);
-    free(vert), free(tmpl), free(body);
+    asprintf(&pre, "%s%s%.*s", HEADER, FRAG_EXTRA, (int)(marker - tmpl), tmpl);
+    int resume = 1; // template line the marker is on, so template errors keep their numbers
+    for (const char *c = pre; *c; c++) resume += *c == '\n';
+    // #line 1 1: the render file is source string 1 and starts at line 1 (errors name its lines)
+    asprintf(&fs, "%s#line 1 1\n%s\n#line %d 0\n%s", pre, body, resume, marker);
+    free(vert), free(tmpl), free(body), free(pre);
 
     memset(sh, 0, sizeof *sh);
     GLuint v = compile(GL_VERTEX_SHADER, vs, err, errn), f = v ? compile(GL_FRAGMENT_SHADER, fs, err, errn) : 0;
     free(vs), free(fs);
-    if (!f) return 0;
+    if (v && !f) glDeleteShader(v);
+    if (!f) return name_errors(err, errn, path), 0;
     sh->prog = glCreateProgram();
     glAttachShader(sh->prog, v), glAttachShader(sh->prog, f);
     glLinkProgram(sh->prog);
@@ -442,9 +484,9 @@ static int is_shader(const char *f) {
     return n > 12 && !strncmp(f, "render.", 7) && !strcmp(f + n - 5, ".glsl");
 }
 
-static int shader_exists(const char *name) {
+static int shader_exists(const char *spec) {
     char path[PATH_MAX];
-    snprintf(path, sizeof path, "%s/render.%s.glsl", shader_dir, name);
+    shader_path(spec, path, sizeof path);
     return !access(path, R_OK);
 }
 
@@ -530,11 +572,16 @@ static double now_s(void) {
     return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
-static void run(const char *name) {
+static void run(const char *spec) {
     if (!gl_init()) die("no OpenGL 3.2 core context available");
     Shader sh;
-    char err[2048];
-    if (!shader_load(&sh, name, err, sizeof err)) die("shader %s: %s", name, err);
+    char err[2048], path[PATH_MAX], shader_err[512] = "";
+    shader_path(spec, path, sizeof path);
+    if (!shader_load(&sh, path, err, sizeof err)) die("shader %s:\n%s", path, err);
+    const char *name = strchr(spec, '/') ? strrchr(spec, '/') + 1 : spec; // header shows the file name
+    struct stat sst;
+    struct timespec shader_mtime = stat(path, &sst) ? (struct timespec){0} : sst.st_mtimespec;
+    double reload_check = 0;
     // without a terminal there is nobody to quit it and nothing to draw on
     if (!isatty(0) || !isatty(1)) die("vibematrix needs a terminal on stdin and stdout");
     watch();
@@ -590,6 +637,16 @@ static void run(const char *name) {
         next = fmax(next + 1.0 / FPS, now_s()); // behind schedule: skip ahead, don't catch up
 
         double now = now_s(), dt = now - last;
+        // live reload: recompile when the shader file changes; a broken save keeps the last good one
+        if (now - reload_check > 0.5 && !stat(path, &sst)) {
+            reload_check = now;
+            if (sst.st_mtimespec.tv_sec != shader_mtime.tv_sec || sst.st_mtimespec.tv_nsec != shader_mtime.tv_nsec) {
+                shader_mtime = sst.st_mtimespec;
+                Shader ns;
+                if (shader_load(&ns, path, err, sizeof err)) shader_free(&sh), sh = ns, shader_err[0] = 0;
+                else snprintf(shader_err, sizeof shader_err, "%.*s", (int)strcspn(err, "\n"), err);
+            }
+        }
         last = now;
 
         pthread_mutex_lock(&mu);
@@ -622,7 +679,9 @@ static void run(const char *name) {
         char head[1024];
         int hn = snprintf(head, sizeof head, " vibematrix  files %.2f  +lines %.2f  -lines %.2f  age %3.0fs  [q]uit  %s  %s%ld files  %s",
                           g.load.x, g.download.x, g.upload.x, fmin(age, 999), name, scanning ? "indexing… " : "", files, root); // path last: may be cut
-        bput(&b, "\x1b[1;1H\x1b[0;1;97;40m%.*s\x1b[K", hn < cols ? hn : cols, head);
+        if (shader_err[0]) // the old shader keeps running; say why the new one isn't
+            hn = snprintf(head, sizeof head, " shader error (still showing the last good version): %s", shader_err);
+        bput(&b, "\x1b[1;1H\x1b[0;1;97;%sm%.*s\x1b[K", shader_err[0] ? "41" : "40", hn < cols ? hn : cols, head);
         for (int i = 0; i < LOG_LINES && frows + 2 + i <= rows; i++) {
             const char *col = log[i].kind == '+' ? "32" : log[i].kind == '-' ? "31" : "33";
             bput(&b, "\x1b[%d;1H\x1b[0;%sm %.*s\x1b[K", frows + 2 + i, col, cols > 1 ? cols - 1 : 0, log[i].text);
@@ -768,7 +827,9 @@ static void selftest(void) {
         snprintf(name, sizeof name, "%.*s", (int)strlen(e->d_name) - 12, e->d_name + 7);
         Shader s;
         total++;
-        if (!shader_load(&s, name, err, sizeof err)) {
+        char path[PATH_MAX];
+        shader_path(name, path, sizeof path);
+        if (!shader_load(&s, path, err, sizeof err)) {
             printf("  broken %s: %.*s\n", name, (int)strcspn(err, "\n"), err);
             continue;
         }
@@ -798,6 +859,30 @@ static void selftest(void) {
     if (d) closedir(d);
     printf("shaders ok: %d / %d\n", ok, total);
     assert(default_ok);
+
+    // custom shader files: name vs path resolution, rendering one, errors pointing into the file
+    char sp[PATH_MAX], want[PATH_MAX];
+    shader_path("oil", sp, sizeof sp), snprintf(want, sizeof want, "%s/render.oil.glsl", shader_dir);
+    assert(!strcmp(sp, want));
+    shader_path("~/x/mine.glsl", sp, sizeof sp), snprintf(want, sizeof want, "%s/x/mine.glsl", getenv("HOME"));
+    assert(!strcmp(sp, want));
+    shader_path("mine.glsl", sp, sizeof sp), assert(!strcmp(sp, "mine.glsl"));
+    shader_path("./a/b", sp, sizeof sp), assert(!strcmp(sp, "./a/b"));
+    char cdir[] = "/tmp/vibematrix.XXXXXX", cpath[PATH_MAX], err[2048];
+    assert(mkdtemp(cdir));
+    snprintf(cpath, sizeof cpath, "%s/mine.glsl", cdir);
+    FILE *sf = fopen(cpath, "w");
+    fputs("// my shader\nvec4 render(vec2 p) {\n    return vec4(p.x + .5, load, download, 1.);\n}\n", sf), fclose(sf);
+    Shader cs2;
+    assert(shader_load(&cs2, cpath, err, sizeof err));
+    memset(px, 0, 64 * 32 * 3);
+    shader_render(&cs2, 64, 32, 1, &u, 1, px);
+    assert(px[3 * 63] > 200 && px[1] > 50); // right edge red (p.x + .5 ~ 1), green = load .3
+    shader_free(&cs2);
+    sf = fopen(cpath, "w"), fputs("vec4 render(vec2 p) {\n    float x = 1.;\n    return bogus;\n}\n", sf), fclose(sf);
+    assert(!shader_load(&cs2, cpath, err, sizeof err));
+    assert(strstr(err, "mine.glsl:3:") && strstr(err, "bogus")); // line 3 of *the file*
+    unlink(cpath), rmdir(cdir);
     puts("ok");
 }
 
@@ -816,17 +901,18 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             char cp[PATH_MAX];
             printf("vibematrix %s: LED cube GLSL shaders in the terminal, driven by file changes\n\n"
-                   "usage: vibematrix [DIR] [--shader NAME]\n\n"
+                   "usage: vibematrix [DIR] [--shader NAME|PATH]\n\n"
                    "  DIR             directory to watch, recursively (default: .)\n"
-                   "  --shader NAME   shader to play (default: %s)\n"
+                   "  --shader NAME   built-in shader to play (default: %s)\n"
+                   "  --shader PATH   your own render .glsl file, reloaded on save (spec: SHADERS.md)\n"
                    "  --test          run the self-test\n"
                    "  --version       print the version\n"
                    "  -h, --help      print this help\n\n"
                    "keys: q or Esc quits (Ctrl-C too)\n\n"
                    "settings, later wins: default < config file < environment < command line\n"
                    "  config file  %s\n"
-                   "               shader = NAME\n"
-                   "  environment  VIBEMATRIX_SHADER=NAME\n\n"
+                   "               shader = NAME or PATH\n"
+                   "  environment  VIBEMATRIX_SHADER=NAME or PATH\n\n"
                    "shaders (%s):\n",
                    VERSION, DEFAULT_SHADER, config_path(cp, sizeof cp) ? cp : "(no $HOME)", shader_dir);
             list_shaders(stdout);
@@ -851,6 +937,9 @@ int main(int argc, char **argv) {
         else dir = argv[i];
     }
     if (!shader_exists(set.shader)) {
+        char sp[PATH_MAX];
+        shader_path(set.shader, sp, sizeof sp);
+        if (is_shader_file(set.shader)) die("shader file not found: %s (from %s)", sp, set.shader_from);
         fprintf(stderr, "unknown shader '%s' (from %s); available:", set.shader, set.shader_from);
         list_shaders(stderr);
         return 1;
