@@ -18,6 +18,7 @@
 #include <OpenGL/gl3.h>
 #include <assert.h>
 #include <dirent.h>
+#include <errno.h>
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
 #include <fts.h>
@@ -508,6 +509,8 @@ static void run(const char *name) {
     Shader sh;
     char err[2048];
     if (!shader_load(&sh, name, err, sizeof err)) die("shader %s: %s", name, err);
+    // without a terminal there is nobody to quit it and nothing to draw on
+    if (!isatty(0) || !isatty(1)) die("vibematrix needs a terminal on stdin and stdout");
     watch();
 
     struct termios raw;
@@ -516,7 +519,7 @@ static void run(const char *name) {
     raw.c_lflag &= ~(ICANON | ECHO);
     raw.c_cc[VMIN] = 0, raw.c_cc[VTIME] = 0; // non-blocking reads
     tcsetattr(0, TCSANOW, &raw);
-    signal(SIGINT, on_signal), signal(SIGTERM, on_signal);
+    signal(SIGINT, on_signal), signal(SIGTERM, on_signal), signal(SIGHUP, on_signal);
     write_all("\x1b[?1049h\x1b[?25l\x1b[2J", 19);
 
     Buf b = {0};
@@ -540,13 +543,20 @@ static void run(const char *name) {
         double wait = pending ? 1.0 : next - now_s();
         struct pollfd pfd[2] = {{0, POLLIN, 0}, {1, POLLOUT, 0}};
         poll(pfd, pending ? 2 : 1, wait > 0 ? (int)(wait * 1000) + 1 : 0);
-        char c;
-        while (read(0, &c, 1) == 1)
-            if (c == 'q' || c == 27) quit = 1;
+        // terminal gone (closed tab, hangup): quit instead of spinning on a dead fd
+        if ((pfd[0].revents | (pending ? pfd[1].revents : 0)) & (POLLHUP | POLLERR | POLLNVAL)) break;
+        if (pfd[0].revents & POLLIN) {
+            char c;
+            ssize_t n = read(0, &c, 1);
+            if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR)) break; // readable but empty: EOF
+            for (; n == 1; n = read(0, &c, 1))
+                if (c == 'q' || c == 27) quit = 1;
+        }
         if (quit) break;
         if (pending) {
             ssize_t k = write(1, b.p + off, b.n - off);
             if (k > 0) off += k;
+            else if (k < 0 && errno != EAGAIN && errno != EINTR) break; // terminal gone
             continue;
         }
         if (now_s() < next) continue;
